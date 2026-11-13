@@ -40,6 +40,8 @@ If Railway exposes the Postgres variable under another reference name, select th
 ```text
 /gen 30
 /gen 30 5
+/Customkey ABCD1234 30 3
+/Customkey ABCD1234 30 Unlimited
 
 /reset DEVENDRAMODS-XXXXX-XXXXX-XXXXX-XXXXX
 /ban DEVENDRAMODS-XXXXX-XXXXX-XXXXX-XXXXX
@@ -78,7 +80,7 @@ JSON:
 }
 ```
 
-First successful verification binds the key to that device. Later requests must use the same device ID.
+A license can be used by the configured number of distinct device IDs. Custom keys support a numeric device limit or Unlimited. Existing keys retain a one-device limit.
 
 The server also rejects banned and expired keys.
 
@@ -87,3 +89,15 @@ The server also rejects banned and expired keys.
 Do not put the bot token, database password, or API secret into a public GitHub repository.
 
 A Lua-only device ID can be spoofed. For stronger anti-sharing protection, the client should eventually use an Android Keystore-backed proof instead of relying only on a Lua-generated fingerprint.
+
+
+## Custom keys
+
+`/Customkey <suffix> <days> <device_no|Unlimited>` creates keys in the format `DEVENDRA_<days>D_<suffix>`.
+
+Examples:
+
+- `/Customkey ABCD1234 30 3` — valid for 30 days, maximum 3 devices.
+- `/Customkey ABCD1234 30 Unlimited` — valid for 30 days, no device-count limit.
+
+The suffix must be 4-32 letters or digits and must be unique. The existing `/gen` command continues to create one-device licenses.
