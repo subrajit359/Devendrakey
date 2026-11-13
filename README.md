@@ -105,3 +105,13 @@ The server rejects invalid, banned, expired and over-limit licenses. Device regi
 ## V3 dashboard
 
 Send `/start` to open the button dashboard. Use the dashboard buttons to generate keys, create custom keys, browse licenses, search, inspect devices, view statistics, check expiring keys, and review admin activity. Select a row in All keys to open its compact license card. Long-press the displayed key text in Telegram to copy it.
+
+
+## V4 Premium management updates
+
+- Fixed Telegram message line breaks in dashboard and license manager text.
+- License manager supports multi-select across pages and select/deselect current page.
+- Bulk actions: ban, unban, pause, resume, and delete (with confirmation).
+- Individual license detail view includes ban/unban/pause/resume actions.
+- Paused licenses are rejected by the verification API with HTTP 403.
+- Existing databases are migrated automatically with a `paused` column at startup.

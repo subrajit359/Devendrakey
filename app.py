@@ -48,7 +48,7 @@ for item in ADMIN_IDS_RAW.split(","):
 if not ADMIN_IDS:
     raise RuntimeError("ADMIN_IDS is missing or invalid")
 
-app = FastAPI(title="DEVENDRAMODS X BYPASS Keysystem", version="3.0.0")
+app = FastAPI(title="DEVENDRAMODS X BYPASS Keysystem", version="4.0.0")
 telegram_app: Application | None = None
 
 
@@ -80,6 +80,7 @@ def init_db():
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS license_type TEXT NOT NULL DEFAULT 'FREE'")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS created_by BIGINT")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '-' ")
+        conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT FALSE")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS license_devices (
                 id BIGSERIAL PRIMARY KEY,
@@ -228,6 +229,8 @@ def format_key_card(row, *, generated: bool = False) -> str:
     now = utcnow()
     if row["banned"]:
         status = "🚫 BANNED"
+    elif row.get("paused", False):
+        status = "⏸ PAUSED"
     elif row["expires_at"] <= now:
         status = "❌ EXPIRED"
     else:
@@ -272,7 +275,7 @@ def dashboard_keyboard():
 def dashboard_text():
     with db() as conn:
         r = conn.execute("""SELECT COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE banned=FALSE AND expires_at > NOW()) AS active,
+            COUNT(*) FILTER (WHERE banned=FALSE AND paused=FALSE AND expires_at > NOW()) AS active,
             COUNT(*) FILTER (WHERE expires_at <= NOW()) AS expired,
             COUNT(*) FILTER (WHERE banned=TRUE) AS banned
             FROM licenses""").fetchone()
@@ -352,8 +355,9 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_admin(update):
         await query.answer("Admin only.", show_alert=True)
         return
-    await query.answer()
     data = query.data or ""
+    if not data.startswith("bulk:"):
+        await query.answer()
     if data == "dash:home":
         await query.edit_message_text(
             dashboard_text(), parse_mode="HTML", reply_markup=dashboard_keyboard()
@@ -378,7 +382,7 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if data == "dash:search":
         await query.edit_message_text(
-            "🔎 <b>Search licenses</b>\\nUse <code>/search KEY_OR_SUFFIX</code> to find a license.",
+            "🔎 <b>Search licenses</b>\nUse <code>/search KEY_OR_SUFFIX</code> to find a license.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="dash:home")]])
         )
@@ -388,9 +392,9 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             r = conn.execute("""SELECT COUNT(*) AS total,
                 COUNT(DISTINCT license_id) AS licenses FROM license_devices""").fetchone()
         await query.edit_message_text(
-            "📱 <b>Device overview</b>\\n\\n"
-            f"Registered devices: <b>{r['total']}</b>\\n"
-            f"Licenses with devices: <b>{r['licenses']}</b>\\n\\n"
+            "📱 <b>Device overview</b>\n\n"
+            f"Registered devices: <b>{r['total']}</b>\n"
+            f"Licenses with devices: <b>{r['licenses']}</b>\n\n"
             "Use <code>/info KEY</code> to inspect a license and <code>/reset KEY</code> to clear its device bindings.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="dash:home")]])
@@ -400,9 +404,9 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         with db() as conn:
             r = conn.execute("""SELECT COUNT(*) AS total,
                 COUNT(*) FILTER (WHERE banned) AS banned,
-                COUNT(*) FILTER (WHERE expires_at > NOW() AND banned=FALSE) AS active,
+                COUNT(*) FILTER (WHERE expires_at > NOW() AND banned=FALSE AND paused=FALSE) AS active,
                 COUNT(*) FILTER (WHERE expires_at <= NOW()) AS expired,
-                COUNT(*) FILTER (WHERE expires_at > NOW() AND expires_at <= NOW()+INTERVAL '7 days' AND banned=FALSE) AS expiring
+                COUNT(*) FILTER (WHERE expires_at > NOW() AND expires_at <= NOW()+INTERVAL '7 days' AND banned=FALSE AND paused=FALSE) AS expiring
                 FROM licenses""").fetchone()
         text = (f"📊 <b>Keysystem statistics</b>\n\n"
                 f"🔑 Total: <b>{r['total']}</b>\n✅ Active: <b>{r['active']}</b>\n"
@@ -429,6 +433,111 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(text[:4000], parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="dash:home")]]))
         return
+    if data.startswith("bulk:"):
+        selected = context.user_data.setdefault("selected_license_ids", set())
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        page = 0
+        try:
+            if action == "single":
+                operation, license_id = parts[2], int(parts[3])
+                single_sql = {
+                    "ban": "UPDATE licenses SET banned=TRUE, ban_reason='Banned by admin' WHERE id=%s",
+                    "unban": "UPDATE licenses SET banned=FALSE, ban_reason=NULL WHERE id=%s",
+                    "pause": "UPDATE licenses SET paused=TRUE WHERE id=%s AND banned=FALSE",
+                    "resume": "UPDATE licenses SET paused=FALSE WHERE id=%s",
+                }
+                if operation not in single_sql:
+                    await query.answer("Unknown action.", show_alert=True)
+                    return
+                with db() as conn:
+                    cur = conn.execute(single_sql[operation], (license_id,))
+                    conn.commit()
+                audit_log(update.effective_user.id, f"SINGLE_{operation.upper()}", str(license_id))
+                await query.answer("Updated." if cur.rowcount else "No change / license not found.", show_alert=True)
+                with db() as conn:
+                    found = conn.execute("SELECT license_key FROM licenses WHERE id=%s", (license_id,)).fetchone()
+                if found:
+                    row = license_display_data(found["license_key"])
+                    await query.edit_message_text(format_key_card(row), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🚫 Ban", callback_data=f"bulk:single:ban:{license_id}"), InlineKeyboardButton("✅ Unban", callback_data=f"bulk:single:unban:{license_id}")],
+                        [InlineKeyboardButton("⏸ Pause", callback_data=f"bulk:single:pause:{license_id}"), InlineKeyboardButton("▶️ Resume", callback_data=f"bulk:single:resume:{license_id}")],
+                        [InlineKeyboardButton("📋 Back to keys", callback_data="keys:0")],
+                        [InlineKeyboardButton("🏠 Dashboard", callback_data="dash:home")],
+                    ]))
+                return
+            if action == "toggle":
+                license_id, page = int(parts[2]), int(parts[3])
+                if license_id in selected:
+                    selected.remove(license_id)
+                else:
+                    selected.add(license_id)
+            elif action == "page":
+                page = int(parts[2])
+                with db() as conn:
+                    page_ids = conn.execute(
+                        "SELECT id FROM licenses ORDER BY id DESC LIMIT 8 OFFSET %s", (page * 8,)
+                    ).fetchall()
+                ids = {r["id"] for r in page_ids}
+                if ids and ids.issubset(selected):
+                    selected.difference_update(ids)
+                else:
+                    selected.update(ids)
+            elif action == "clear":
+                page = int(parts[2])
+                selected.clear()
+            elif action == "action":
+                operation, page = parts[2], int(parts[3])
+                ids = sorted(selected)
+                if not ids:
+                    await query.answer("Select at least one license first.", show_alert=True)
+                    return
+                if operation == "delete":
+                    await query.answer("Confirm deletion in the next screen.")
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🗑 Confirm delete", callback_data=f"bulk:delete_yes:{page}"),
+                         InlineKeyboardButton("Cancel", callback_data=f"keys:{page}")],
+                    ])
+                    await query.edit_message_text(
+                        f"⚠️ <b>Delete {len(ids)} selected licenses?</b>\nThis also removes their registered device records. This cannot be undone.",
+                        parse_mode="HTML", reply_markup=keyboard)
+                    return
+                updates = {
+                    "ban": ("UPDATE licenses SET banned=TRUE, ban_reason='Bulk action by admin' WHERE id=ANY(%s)", "BULK_BAN"),
+                    "unban": ("UPDATE licenses SET banned=FALSE, ban_reason=NULL WHERE id=ANY(%s)", "BULK_UNBAN"),
+                    "pause": ("UPDATE licenses SET paused=TRUE WHERE id=ANY(%s) AND banned=FALSE", "BULK_PAUSE"),
+                    "resume": ("UPDATE licenses SET paused=FALSE WHERE id=ANY(%s)", "BULK_RESUME"),
+                }
+                if operation not in updates:
+                    await query.answer("Unknown action.", show_alert=True)
+                    return
+                sql, log_action = updates[operation]
+                with db() as conn:
+                    cur = conn.execute(sql, (ids,))
+                    conn.commit()
+                audit_log(update.effective_user.id, log_action, f"{cur.rowcount} licenses", f"IDs: {ids[:100]}")
+                selected.clear()
+                await query.answer(f"Updated {cur.rowcount} license(s).", show_alert=True)
+            elif action == "delete_yes":
+                page = int(parts[2])
+                ids = sorted(selected)
+                if not ids:
+                    await query.answer("Selection expired. Select licenses again.", show_alert=True)
+                    return
+                with db() as conn:
+                    cur = conn.execute("DELETE FROM licenses WHERE id=ANY(%s)", (ids,))
+                    conn.commit()
+                audit_log(update.effective_user.id, "BULK_DELETE", f"{cur.rowcount} licenses", f"IDs: {ids[:100]}")
+                selected.clear()
+                await query.answer(f"Deleted {cur.rowcount} license(s).", show_alert=True)
+            if action in {"toggle", "page", "clear"}:
+                await query.answer("Selection updated.")
+        except (ValueError, IndexError):
+            await query.answer("Invalid bulk action.", show_alert=True)
+            return
+        # Refresh the license manager after selection or an action.
+        data = f"keys:{page}"
+
     if data.startswith("keys:"):
         try:
             page = max(0, min(int(data.split(":", 1)[1]), 100000))
@@ -436,10 +545,11 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             page = 0
         per_page = 8
         offset = page * per_page
+        selected = context.user_data.setdefault("selected_license_ids", set())
         with db() as conn:
             total = conn.execute("SELECT COUNT(*) AS n FROM licenses").fetchone()["n"]
             rows = conn.execute(
-                """SELECT l.id, l.license_key, l.expires_at, l.banned, l.device_limit,
+                """SELECT l.id, l.license_key, l.expires_at, l.banned, l.paused, l.device_limit,
                           COUNT(d.id) AS device_count
                    FROM licenses l LEFT JOIN license_devices d ON d.license_id=l.id
                    GROUP BY l.id ORDER BY l.id DESC LIMIT %s OFFSET %s""",
@@ -450,7 +560,7 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             offset = page * per_page
             with db() as conn:
                 rows = conn.execute(
-                    """SELECT l.id, l.license_key, l.expires_at, l.banned, l.device_limit,
+                    """SELECT l.id, l.license_key, l.expires_at, l.banned, l.paused, l.device_limit,
                               COUNT(d.id) AS device_count
                        FROM licenses l LEFT JOIN license_devices d ON d.license_id=l.id
                        GROUP BY l.id ORDER BY l.id DESC LIMIT %s OFFSET %s""",
@@ -459,12 +569,27 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         keyboard = []
         for r in rows:
             limit = "∞" if r["device_limit"] is None else str(r["device_limit"] or 1)
-            status = "🚫" if r["banned"] else ("❌" if r["expires_at"] <= utcnow() else "✅")
+            status = "🚫" if r["banned"] else ("⏸" if r["paused"] else ("❌" if r["expires_at"] <= utcnow() else "✅"))
             short_key = r["license_key"] if len(r["license_key"]) <= 25 else r["license_key"][:22] + "…"
+            checked = "☑️" if r["id"] in selected else "⬜"
             keyboard.append([InlineKeyboardButton(
-                f"{status} {short_key} · {r['device_count']}/{limit}",
-                callback_data=f"keyview:{r['id']}"
+                f"{checked} {status} {short_key} · {r['device_count']}/{limit}",
+                callback_data=f"bulk:toggle:{r['id']}:{page}"
             )])
+            keyboard.append([InlineKeyboardButton(
+                f"🔎 View {short_key}", callback_data=f"keyview:{r['id']}"
+            )])
+        if rows:
+            keyboard.append([InlineKeyboardButton("☑️ Select / deselect this page", callback_data=f"bulk:page:{page}"),
+                             InlineKeyboardButton("✖ Clear selection", callback_data=f"bulk:clear:{page}")])
+        if selected:
+            keyboard.extend([
+                [InlineKeyboardButton(f"🚫 Ban ({len(selected)})", callback_data=f"bulk:action:ban:{page}"),
+                 InlineKeyboardButton(f"✅ Unban ({len(selected)})", callback_data=f"bulk:action:unban:{page}")],
+                [InlineKeyboardButton(f"⏸ Pause ({len(selected)})", callback_data=f"bulk:action:pause:{page}"),
+                 InlineKeyboardButton(f"▶️ Resume ({len(selected)})", callback_data=f"bulk:action:resume:{page}")],
+                [InlineKeyboardButton(f"🗑 Delete ({len(selected)})", callback_data=f"bulk:action:delete:{page}")],
+            ])
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"keys:{page-1}"))
@@ -474,11 +599,12 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             keyboard.append(nav)
         keyboard.append([InlineKeyboardButton("🏠 Dashboard", callback_data="dash:home")])
         text = (
-            "📋 <b>LICENSE MANAGER</b>\\n"
-            "━━━━━━━━━━━━━━━━━━\\n"
-            f"Page <b>{page + 1}</b> · <b>{total}</b> licenses\\n\\n"
-            "Select a license to view its details."
-            if rows else "📋 <b>LICENSE MANAGER</b>\\n\\nNo licenses found."
+            "📋 <b>LICENSE MANAGER</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"Page <b>{page + 1}</b> · <b>{total}</b> licenses\n"
+            f"Selected: <b>{len(selected)}</b>\n\n"
+            "Tap a license row to select it. Use View to inspect details."
+            if rows else "📋 <b>LICENSE MANAGER</b>\n\nNo licenses found."
         )
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -487,15 +613,23 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             license_id = int(data.split(":", 1)[1])
         except ValueError:
-            await query.answer("Invalid license.", show_alert=True)
             return
         with db() as conn:
             found = conn.execute("SELECT license_key FROM licenses WHERE id=%s", (license_id,)).fetchone()
         if not found:
-            await query.answer("License no longer exists.", show_alert=True)
+            await query.edit_message_text("License no longer exists.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to keys", callback_data="keys:0")]]))
             return
         row = license_display_data(found["license_key"])
+        state_buttons = [
+            InlineKeyboardButton("🚫 Ban", callback_data=f"bulk:single:ban:{license_id}"),
+            InlineKeyboardButton("✅ Unban", callback_data=f"bulk:single:unban:{license_id}"),
+        ]
+        pause_buttons = [
+            InlineKeyboardButton("⏸ Pause", callback_data=f"bulk:single:pause:{license_id}"),
+            InlineKeyboardButton("▶️ Resume", callback_data=f"bulk:single:resume:{license_id}"),
+        ]
         keyboard = InlineKeyboardMarkup([
+            state_buttons, pause_buttons,
             [InlineKeyboardButton("📋 Back to keys", callback_data="keys:0")],
             [InlineKeyboardButton("🏠 Dashboard", callback_data="dash:home")]
         ])
@@ -739,7 +873,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT l.license_key, l.expires_at, l.banned, l.device_limit,
+            SELECT l.license_key, l.expires_at, l.banned, l.paused, l.device_limit,
                    COUNT(d.id) AS device_count
             FROM licenses l
             LEFT JOIN license_devices d ON d.license_id=l.id
@@ -756,7 +890,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     for r in rows:
         lim = "Unlimited" if r["device_limit"] is None else str(r["device_limit"])
-        status = "BANNED" if r["banned"] else f'{r["device_count"]}/{lim} devices' 
+        status = "BANNED" if r["banned"] else ("PAUSED" if r["paused"] else f'{r["device_count"]}/{lim} devices') 
         lines.append(
             f"{r['license_key']} | {status} | {r['expires_at'].date()}"
         )
@@ -775,7 +909,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 COUNT(*) AS total,
                 COUNT(*) FILTER (WHERE banned=TRUE) AS banned,
                 (SELECT COUNT(DISTINCT license_id) FROM license_devices) AS bound,
-                COUNT(*) FILTER (WHERE expires_at > NOW() AND banned=FALSE) AS active,
+                COUNT(*) FILTER (WHERE expires_at > NOW() AND banned=FALSE AND paused=FALSE) AS active,
                 COUNT(*) FILTER (WHERE expires_at <= NOW()) AS expired
             FROM licenses
             """
@@ -850,6 +984,9 @@ def verify_license(
                 detail=row["ban_reason"] or "Key is banned",
             )
 
+        if row.get("paused", False):
+            raise HTTPException(status_code=403, detail="Key is paused")
+
         if row["expires_at"] <= now:
             raise HTTPException(status_code=403, detail="Key expired")
 
@@ -914,7 +1051,7 @@ async def startup():
     telegram_app.add_handler(CommandHandler("stats", cmd_stats))
     telegram_app.add_handler(CommandHandler("search", cmd_search))
     telegram_app.add_handler(CommandHandler("expiring", cmd_expiring))
-    telegram_app.add_handler(CallbackQueryHandler(dashboard_callback, pattern=r"^(dash:|keys:|keyview:)"))
+    telegram_app.add_handler(CallbackQueryHandler(dashboard_callback, pattern=r"^(dash:|keys:|keyview:|bulk:)"))
 
     await telegram_app.initialize()
     await telegram_app.start()
