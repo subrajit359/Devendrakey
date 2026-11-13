@@ -75,6 +75,9 @@ def init_db():
         conn.execute("""
             ALTER TABLE licenses ADD COLUMN IF NOT EXISTS device_limit INTEGER DEFAULT 1
         """)
+        conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS license_type TEXT NOT NULL DEFAULT 'FREE'")
+        conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS created_by BIGINT")
+        conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '-' ")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS license_devices (
                 id BIGSERIAL PRIMARY KEY,
@@ -138,9 +141,9 @@ def create_license(days: int):
             with db() as conn:
                 row = conn.execute(
                     """
-                    INSERT INTO licenses (license_key, expires_at)
-                    VALUES (%s, %s)
-                    RETURNING license_key, expires_at
+                    INSERT INTO licenses (license_key, expires_at, license_type)
+                    VALUES (%s, %s, 'FREE')
+                    RETURNING license_key, expires_at, device_limit
                     """,
                     (key, utcnow() + timedelta(days=days)),
                 ).fetchone()
@@ -163,8 +166,8 @@ def create_custom_license(suffix: str, days: int, device_limit):
     key = f"DEVENDRA_{days}D_{suffix}"
     with db() as conn:
         row = conn.execute(
-            """INSERT INTO licenses (license_key, expires_at, device_limit)
-               VALUES (%s, %s, %s)
+            """INSERT INTO licenses (license_key, expires_at, device_limit, license_type)
+               VALUES (%s, %s, %s, 'CUSTOM')
                RETURNING license_key, expires_at, device_limit""",
             (key, utcnow() + timedelta(days=days), device_limit),
         ).fetchone()
@@ -193,20 +196,57 @@ async def admin_only(update: Update) -> bool:
     return True
 
 
+def license_display_data(key: str):
+    with db() as conn:
+        row = conn.execute(
+            """SELECT l.*, COUNT(d.id) AS device_count
+               FROM licenses l LEFT JOIN license_devices d ON d.license_id=l.id
+               WHERE l.license_key=%s GROUP BY l.id""",
+            (key.strip().upper(),),
+        ).fetchone()
+    return row
+
+
+def format_key_card(row, *, generated: bool = False) -> str:
+    now = utcnow()
+    if row["banned"]:
+        status = "🚫 Banned"
+    elif row["expires_at"] <= now:
+        status = "❌ Expired"
+    else:
+        status = "✅ Active"
+    limit = "Unlimited" if row["device_limit"] is None else str(row["device_limit"] or 1)
+    created = row["created_at"].strftime("%Y-%m-%d")
+    expires = row["expires_at"].strftime("%Y-%m-%d %H:%M UTC")
+    uid = row["created_by"] if row["created_by"] is not None else "-"
+    return (
+        f"{status}\n\n"
+        "🔑 Key Info\n\n"
+        f"🗝 Key: <code>{row['license_key']}</code>\n"
+        f"📋 Type: {row['license_type']}\n"
+        f"⏰ Expires: {expires}\n"
+        f"📱 Devices: {row['device_count']}/{limit}\n"
+        f"👤 UID: {uid}\n"
+        f"📅 Created: {created}\n"
+        f"📊 Status: {status}\n"
+        f"📝 Note: {row['note'] or '-'}"
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update):
         return
     await update.effective_message.reply_text(
-        "👑 DEVENDRAMODS X BYPASS Keysystem\\n\\n"
-        "/gen <days> [count]\\n"
-        "/Customkey <suffix> <days> <device_no|Unlimited>\\n"
-        "/reset <key>\\n"
-        "/ban <key> [reason]\\n"
-        "/unban <key>\\n"
-        "/extend <key> <days>\\n"
-        "/delete <key>\\n"
-        "/info <key>\\n"
-        "/list\\n"
+        "👑 DEVENDRAMODS X BYPASS Keysystem\n\n"
+        "/gen <days> [count]\n"
+        "/Customkey <suffix> <days> <device_no|Unlimited>\n"
+        "/reset <key>\n"
+        "/ban <key> [reason]\n"
+        "/unban <key>\n"
+        "/extend <key> <days>\n"
+        "/delete <key>\n"
+        "/info <key>\n"
+        "/list\n"
         "/stats"
     )
 
@@ -224,13 +264,21 @@ async def cmd_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /gen <days> [count]\nExample: /gen 30 5")
         return
 
-    keys = []
+    cards = []
     for _ in range(count):
-        row = create_license(days)
-        keys.append(f"{row['license_key']} — {row['expires_at'].date()}")
+        created = create_license(days)
+        with db() as conn:
+            conn.execute(
+                "UPDATE licenses SET created_by=%s WHERE license_key=%s",
+                (update.effective_user.id, created["license_key"]),
+            )
+            conn.commit()
+        row = license_display_data(created["license_key"])
+        cards.append(format_key_card(row, generated=True))
 
     await update.message.reply_text(
-        f"✅ Generated {len(keys)} key(s):\n\n" + "\n".join(keys)
+        "\n\n━━━━━━━━━━━━━━━━\n\n".join(cards),
+        parse_mode="HTML",
     )
 
 
@@ -255,12 +303,15 @@ async def cmd_customkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example: /Customkey ABCD1234 30 Unlimited"
         )
         return
-    limit_text = "Unlimited" if row["device_limit"] is None else str(row["device_limit"])
+    with db() as conn:
+        conn.execute(
+            "UPDATE licenses SET created_by=%s WHERE license_key=%s",
+            (update.effective_user.id, row["license_key"]),
+        )
+        conn.commit()
+    full_row = license_display_data(row["license_key"])
     await update.effective_message.reply_text(
-        "✅ Custom key created\\n"
-        f"🔑 {row['license_key']}\\n"
-        f"📅 Expires: {row['expires_at'].date()}\\n"
-        f"📱 Device limit: {limit_text}"
+        format_key_card(full_row, generated=True), parse_mode="HTML"
     )
 
 
@@ -399,12 +450,9 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Key not found.")
         return
 
+    full_row = license_display_data(row["license_key"])
     await update.message.reply_text(
-        f"🔑 {row['license_key']}\n"
-        f"📅 Expires: {row['expires_at']}\n"
-        f"📱 Bound: {'Yes' if row['device_hash'] else 'No'}\n"
-        f"🚫 Banned: {'Yes' if row['banned'] else 'No'}\n"
-        f"🔎 Checks: {row['total_checks']}"
+        format_key_card(full_row), parse_mode="HTML"
     )
 
 
