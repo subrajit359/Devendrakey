@@ -87,12 +87,3 @@ The server also rejects banned and expired keys.
 Do not put the bot token, database password, or API secret into a public GitHub repository.
 
 A Lua-only device ID can be spoofed. For stronger anti-sharing protection, the client should eventually use an Android Keystore-backed proof instead of relying only on a Lua-generated fingerprint.
-
-
-## Custom keys
-
-`/Customkey <suffix> <days> <device_no|Unlimited>`
-
-`/Customkey ABCD1234 30 3` creates `DEVENDRA_30D_ABCD1234` for up to 3 devices.
-
-`/Customkey ABCD1234 30 Unlimited` creates a 30-day key with unlimited devices. Existing keys keep their one-device limit. The database migrates automatically at startup.

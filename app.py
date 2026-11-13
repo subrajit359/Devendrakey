@@ -2,6 +2,7 @@ import os
 import secrets
 import string
 import hashlib
+import re
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -72,6 +73,30 @@ def init_db():
             )
         """)
         conn.execute("""
+            ALTER TABLE licenses ADD COLUMN IF NOT EXISTS device_limit INTEGER DEFAULT 1
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS license_devices (
+                id BIGSERIAL PRIMARY KEY,
+                license_id BIGINT NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+                device_id TEXT NOT NULL,
+                device_hash TEXT NOT NULL,
+                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (license_id, device_hash)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_license_devices_license
+            ON license_devices(license_id)
+        """)
+        conn.execute("""
+            INSERT INTO license_devices (license_id, device_id, device_hash)
+            SELECT id, device_id, device_hash FROM licenses
+            WHERE device_hash IS NOT NULL
+            ON CONFLICT (license_id, device_hash) DO NOTHING
+        """)
+        conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_licenses_device_hash
             ON licenses(device_hash)
         """)
@@ -127,6 +152,26 @@ def create_license(days: int):
     raise RuntimeError("Could not generate a unique license key")
 
 
+def create_custom_license(suffix: str, days: int, device_limit):
+    if not 1 <= days <= 36500:
+        raise ValueError("days must be between 1 and 36500")
+    suffix = suffix.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{4,32}", suffix):
+        raise ValueError("suffix must be 4-32 letters or digits")
+    if device_limit is not None and not 1 <= device_limit <= 100000:
+        raise ValueError("device limit must be 1-100000")
+    key = f"DEVENDRA_{days}D_{suffix}"
+    with db() as conn:
+        row = conn.execute(
+            """INSERT INTO licenses (license_key, expires_at, device_limit)
+               VALUES (%s, %s, %s)
+               RETURNING license_key, expires_at, device_limit""",
+            (key, utcnow() + timedelta(days=days), device_limit),
+        ).fetchone()
+        conn.commit()
+        return row
+
+
 def get_license(key: str):
     with db() as conn:
         return conn.execute(
@@ -151,16 +196,17 @@ async def admin_only(update: Update) -> bool:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update):
         return
-    await update.message.reply_text(
-        "👑 DEVENDRAMODS X BYPASS Keysystem\n\n"
-        "/gen <days> [count]\n"
-        "/reset <key>\n"
-        "/ban <key> [reason]\n"
-        "/unban <key>\n"
-        "/extend <key> <days>\n"
-        "/delete <key>\n"
-        "/info <key>\n"
-        "/list\n"
+    await update.effective_message.reply_text(
+        "👑 DEVENDRAMODS X BYPASS Keysystem\\n\\n"
+        "/gen <days> [count]\\n"
+        "/Customkey <suffix> <days> <device_no|Unlimited>\\n"
+        "/reset <key>\\n"
+        "/ban <key> [reason]\\n"
+        "/unban <key>\\n"
+        "/extend <key> <days>\\n"
+        "/delete <key>\\n"
+        "/info <key>\\n"
+        "/list\\n"
         "/stats"
     )
 
@@ -188,6 +234,36 @@ async def cmd_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_customkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        return
+    try:
+        if len(context.args) != 3:
+            raise ValueError
+        suffix = context.args[0]
+        days = int(context.args[1])
+        device_arg = context.args[2]
+        limit = None if device_arg.lower() == "unlimited" else int(device_arg)
+        row = create_custom_license(suffix, days, limit)
+    except psycopg.errors.UniqueViolation:
+        await update.effective_message.reply_text("❌ That suffix already exists. Choose another.")
+        return
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Usage: /Customkey <suffix> <days> <device_no|Unlimited>\\n"
+            "Example: /Customkey ABCD1234 30 3\\n"
+            "Example: /Customkey ABCD1234 30 Unlimited"
+        )
+        return
+    limit_text = "Unlimited" if row["device_limit"] is None else str(row["device_limit"])
+    await update.effective_message.reply_text(
+        "✅ Custom key created\\n"
+        f"🔑 {row['license_key']}\\n"
+        f"📅 Expires: {row['expires_at'].date()}\\n"
+        f"📱 Device limit: {limit_text}"
+    )
+
+
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update):
         return
@@ -197,6 +273,9 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     key = context.args[0].strip().upper()
     with db() as conn:
+        lic = conn.execute("SELECT id FROM licenses WHERE license_key=%s", (key,)).fetchone()
+        if lic:
+            conn.execute("DELETE FROM license_devices WHERE license_id=%s", (lic["id"],))
         cur = conn.execute(
             """
             UPDATE licenses
@@ -336,9 +415,12 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT license_key, expires_at, device_hash, banned
-            FROM licenses
-            ORDER BY id DESC
+            SELECT l.license_key, l.expires_at, l.banned, l.device_limit,
+                   COUNT(d.id) AS device_count
+            FROM licenses l
+            LEFT JOIN license_devices d ON d.license_id=l.id
+            GROUP BY l.id
+            ORDER BY l.id DESC
             LIMIT 50
             """
         ).fetchall()
@@ -349,9 +431,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = []
     for r in rows:
-        status = "BANNED" if r["banned"] else (
-            "BOUND" if r["device_hash"] else "UNBOUND"
-        )
+        lim = "Unlimited" if r["device_limit"] is None else str(r["device_limit"])
+        status = "BANNED" if r["banned"] else f'{r["device_count"]}/{lim} devices' 
         lines.append(
             f"{r['license_key']} | {status} | {r['expires_at'].date()}"
         )
@@ -369,7 +450,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SELECT
                 COUNT(*) AS total,
                 COUNT(*) FILTER (WHERE banned=TRUE) AS banned,
-                COUNT(*) FILTER (WHERE device_hash IS NOT NULL) AS bound,
+                (SELECT COUNT(DISTINCT license_id) FROM license_devices) AS bound,
                 COUNT(*) FILTER (WHERE expires_at > NOW() AND banned=FALSE) AS active,
                 COUNT(*) FILTER (WHERE expires_at <= NOW()) AS expired
             FROM licenses
@@ -448,38 +529,36 @@ def verify_license(
         if row["expires_at"] <= now:
             raise HTTPException(status_code=403, detail="Key expired")
 
+        existing = conn.execute(
+            "SELECT id FROM license_devices WHERE license_id=%s AND device_hash=%s",
+            (row["id"], dhash),
+        ).fetchone()
         first_activation = False
-
-        if row["device_hash"] is None:
+        if existing:
+            conn.execute("UPDATE license_devices SET last_seen_at=NOW() WHERE id=%s", (existing["id"],))
+        else:
+            device_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM license_devices WHERE license_id=%s",
+                (row["id"],),
+            ).fetchone()["n"]
+            device_limit = row["device_limit"]
+            if device_limit is not None and device_count >= device_limit:
+                raise HTTPException(status_code=403, detail=f"Device limit reached ({device_limit})")
             conn.execute(
-                """
-                UPDATE licenses
-                SET device_id=%s,
-                    device_hash=%s,
-                    activated_at=COALESCE(activated_at, NOW()),
-                    last_seen_at=NOW(),
-                    total_checks=total_checks+1
-                WHERE license_key=%s
-                """,
-                (device, dhash, key),
+                """INSERT INTO license_devices (license_id, device_id, device_hash)
+                   VALUES (%s, %s, %s)""",
+                (row["id"], device, dhash),
             )
             first_activation = True
-        elif not secrets.compare_digest(row["device_hash"], dhash):
-            raise HTTPException(
-                status_code=403,
-                detail="Key is already bound to another device",
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE licenses
-                SET last_seen_at=NOW(),
-                    total_checks=total_checks+1
-                WHERE license_key=%s
-                """,
-                (key,),
-            )
-
+        conn.execute(
+            """UPDATE licenses
+               SET device_id=COALESCE(device_id, %s),
+                   device_hash=COALESCE(device_hash, %s),
+                   activated_at=COALESCE(activated_at, NOW()),
+                   last_seen_at=NOW(), total_checks=total_checks+1
+               WHERE id=%s""",
+            (device, dhash, row["id"]),
+        )
         conn.commit()
 
     return VerifyResponse(
@@ -500,6 +579,7 @@ async def startup():
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("help", cmd_start))
     telegram_app.add_handler(CommandHandler("gen", cmd_gen))
+    telegram_app.add_handler(CommandHandler("customkey", cmd_customkey))
     telegram_app.add_handler(CommandHandler("reset", cmd_reset))
     telegram_app.add_handler(CommandHandler("ban", cmd_ban))
     telegram_app.add_handler(CommandHandler("unban", cmd_unban))
