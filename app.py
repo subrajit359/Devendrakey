@@ -2,6 +2,7 @@ import os
 import secrets
 import string
 import hashlib
+import html
 import re
 import logging
 from datetime import datetime, timezone, timedelta
@@ -12,10 +13,11 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
 
@@ -46,7 +48,7 @@ for item in ADMIN_IDS_RAW.split(","):
 if not ADMIN_IDS:
     raise RuntimeError("ADMIN_IDS is missing or invalid")
 
-app = FastAPI(title="DEVENDRAMODS X BYPASS Keysystem", version="1.0.0")
+app = FastAPI(title="DEVENDRAMODS X BYPASS Keysystem", version="3.0.0")
 telegram_app: Application | None = None
 
 
@@ -106,6 +108,20 @@ def init_db():
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_licenses_expires_at
             ON licenses(expires_at)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_audit_logs (
+                id BIGSERIAL PRIMARY KEY,
+                admin_id BIGINT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT,
+                details TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_created
+            ON admin_audit_logs(created_at DESC)
         """)
         conn.commit()
 
@@ -208,47 +224,284 @@ def license_display_data(key: str):
 
 
 def format_key_card(row, *, generated: bool = False) -> str:
+    """Compact, consistent license card used by /gen, /Customkey and /info."""
     now = utcnow()
     if row["banned"]:
-        status = "🚫 Banned"
+        status = "🚫 BANNED"
     elif row["expires_at"] <= now:
-        status = "❌ Expired"
+        status = "❌ EXPIRED"
     else:
-        status = "✅ Active"
-    limit = "Unlimited" if row["device_limit"] is None else str(row["device_limit"] or 1)
-    created = row["created_at"].strftime("%Y-%m-%d")
-    expires = row["expires_at"].strftime("%Y-%m-%d %H:%M UTC")
+        status = "✅ ACTIVE"
+
+    limit = "∞" if row["device_limit"] is None else str(row["device_limit"] or 1)
+    created = row["created_at"].strftime("%d %b %Y")
+    expires = row["expires_at"].strftime("%d %b %Y · %H:%M UTC")
     uid = row["created_by"] if row["created_by"] is not None else "-"
+    key = html.escape(str(row["license_key"]))
+    license_type = html.escape(str(row["license_type"] or "FREE"))
+    note = html.escape(str(row["note"] or "-"))
+
     return (
-        f"{status}\n\n"
-        "🔑 Key Info\n\n"
-        f"🗝 Key: <code>{row['license_key']}</code>\n"
-        f"📋 Type: {row['license_type']}\n"
-        f"⏰ Expires: {expires}\n"
-        f"📱 Devices: {row['device_count']}/{limit}\n"
-        f"👤 UID: {uid}\n"
+        f"<b>{status}  ·  LICENSE</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 <code>{key}</code>\n"
+        f"🏷 Type: <b>{license_type}</b>  ·  📱 <b>{row['device_count']}/{limit}</b> devices\n"
+        f"⏳ Expires: <code>{expires}</code>\n"
+        f"👤 UID: <code>{uid}</code>\n"
         f"📅 Created: {created}\n"
-        f"📊 Status: {status}\n"
-        f"📝 Note: {row['note'] or '-'}"
+        f"📝 Note: {note}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "<i>Long-press the key above to copy it.</i>"
     )
+
+
+def dashboard_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔑 Generate", callback_data="dash:generate"),
+         InlineKeyboardButton("🛠 Custom key", callback_data="dash:custom")],
+        [InlineKeyboardButton("📋 All keys", callback_data="keys:0"),
+         InlineKeyboardButton("🔎 Search", callback_data="dash:search")],
+        [InlineKeyboardButton("📱 Devices", callback_data="dash:devices"),
+         InlineKeyboardButton("📊 Statistics", callback_data="dash:stats")],
+        [InlineKeyboardButton("⏳ Expiring", callback_data="dash:expiring"),
+         InlineKeyboardButton("🧾 Activity", callback_data="dash:logs")],
+        [InlineKeyboardButton("📖 Help & commands", callback_data="dash:help")],
+    ])
+
+
+def dashboard_text():
+    with db() as conn:
+        r = conn.execute("""SELECT COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE banned=FALSE AND expires_at > NOW()) AS active,
+            COUNT(*) FILTER (WHERE expires_at <= NOW()) AS expired,
+            COUNT(*) FILTER (WHERE banned=TRUE) AS banned
+            FROM licenses""").fetchone()
+    return (
+        "👑 <b>DEVENDRAMODS X</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🔐 <b>BYPASS KEYSYSTEM · ADMIN</b>\n\n"
+        f"🔑 Total: <b>{r['total']}</b>   "
+        f"✅ Active: <b>{r['active']}</b>\n"
+        f"⏳ Expired: <b>{r['expired']}</b>   "
+        f"🚫 Banned: <b>{r['banned']}</b>\n\n"
+        "<i>Select a section to manage your licenses.</i>"
+    )
+
+
+def audit_log(admin_id: int, action: str, target: str = "-", details: str = "-"):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO admin_audit_logs (admin_id, action, target, details) VALUES (%s,%s,%s,%s)",
+            (admin_id, action[:80], target[:256], details[:1000]),
+        )
+        conn.commit()
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update):
         return
     await update.effective_message.reply_text(
-        "👑 DEVENDRAMODS X BYPASS Keysystem\n\n"
-        "/gen <days> [count]\n"
-        "/Customkey <suffix> <days> <device_no|Unlimited>\n"
-        "/reset <key>\n"
-        "/ban <key> [reason]\n"
-        "/unban <key>\n"
-        "/extend <key> <days>\n"
-        "/delete <key>\n"
-        "/info <key>\n"
-        "/list\n"
-        "/stats"
+        dashboard_text(),
+        parse_mode="HTML",
+        reply_markup=dashboard_keyboard(),
     )
+
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /search <key-or-suffix>")
+        return
+    term = " ".join(context.args).strip().upper()
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT license_key FROM licenses
+               WHERE UPPER(license_key) LIKE %s
+               ORDER BY id DESC LIMIT 20""",
+            (f"%{term}%",),
+        ).fetchall()
+    if not rows:
+        await update.effective_message.reply_text("🔎 No matching keys found.")
+        return
+    await update.effective_message.reply_text(
+        "🔎 <b>Search results</b>\n\n" +
+        "\n".join(f"• <code>{r['license_key']}</code>" for r in rows),
+        parse_mode="HTML",
+    )
+
+
+async def cmd_expiring(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        return
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT license_key, expires_at FROM licenses
+               WHERE banned=FALSE AND expires_at > NOW()
+                 AND expires_at <= NOW() + INTERVAL '7 days'
+               ORDER BY expires_at ASC LIMIT 30"""
+        ).fetchall()
+    if not rows:
+        await update.effective_message.reply_text("✅ No keys expire in the next 7 days.")
+        return
+    lines = [f"• <code>{r['license_key']}</code> — {r['expires_at'].strftime('%Y-%m-%d %H:%M UTC')}" for r in rows]
+    await update.effective_message.reply_text("⏳ <b>Expiring within 7 days</b>\n\n" + "\n".join(lines), parse_mode="HTML")
+
+
+async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(update):
+        await query.answer("Admin only.", show_alert=True)
+        return
+    await query.answer()
+    data = query.data or ""
+    if data == "dash:home":
+        await query.edit_message_text(
+            dashboard_text(), parse_mode="HTML", reply_markup=dashboard_keyboard()
+        )
+        return
+    if data == "dash:generate":
+        await query.edit_message_text("🔑 <b>Generate keys</b>\nUse: <code>/gen &lt;days&gt; [count]</code>\nExample: <code>/gen 30 5</code>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="dash:home")]]))
+        return
+    if data == "dash:custom":
+        await query.edit_message_text("🛠 <b>Custom key</b>\nUse: <code>/Customkey &lt;suffix&gt; &lt;days&gt; &lt;device_no|Unlimited&gt;</code>\nExample: <code>/Customkey ABCD1234 30 Unlimited</code>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="dash:home")]]))
+        return
+    if data == "dash:help":
+        text = ("👑 <b>DEVENDRAMODS X BYPASS Keysystem</b>\n\n"
+                "/gen &lt;days&gt; [count]\n/Customkey &lt;suffix&gt; &lt;days&gt; &lt;device_no|Unlimited&gt;\n"
+                "/reset &lt;key&gt;\n/ban &lt;key&gt; [reason]\n/unban &lt;key&gt;\n"
+                "/extend &lt;key&gt; &lt;days&gt;\n/delete &lt;key&gt;\n/info &lt;key&gt;\n"
+                "/search &lt;key-or-suffix&gt;\n/list\n/expiring\n/stats")
+        await query.edit_message_text(text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="dash:home")]]))
+        return
+    if data == "dash:search":
+        await query.edit_message_text(
+            "🔎 <b>Search licenses</b>\\nUse <code>/search KEY_OR_SUFFIX</code> to find a license.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="dash:home")]])
+        )
+        return
+    if data == "dash:devices":
+        with db() as conn:
+            r = conn.execute("""SELECT COUNT(*) AS total,
+                COUNT(DISTINCT license_id) AS licenses FROM license_devices""").fetchone()
+        await query.edit_message_text(
+            "📱 <b>Device overview</b>\\n\\n"
+            f"Registered devices: <b>{r['total']}</b>\\n"
+            f"Licenses with devices: <b>{r['licenses']}</b>\\n\\n"
+            "Use <code>/info KEY</code> to inspect a license and <code>/reset KEY</code> to clear its device bindings.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="dash:home")]])
+        )
+        return
+    if data == "dash:stats":
+        with db() as conn:
+            r = conn.execute("""SELECT COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE banned) AS banned,
+                COUNT(*) FILTER (WHERE expires_at > NOW() AND banned=FALSE) AS active,
+                COUNT(*) FILTER (WHERE expires_at <= NOW()) AS expired,
+                COUNT(*) FILTER (WHERE expires_at > NOW() AND expires_at <= NOW()+INTERVAL '7 days' AND banned=FALSE) AS expiring
+                FROM licenses""").fetchone()
+        text = (f"📊 <b>Keysystem statistics</b>\n\n"
+                f"🔑 Total: <b>{r['total']}</b>\n✅ Active: <b>{r['active']}</b>\n"
+                f"⏳ Expiring in 7 days: <b>{r['expiring']}</b>\n❌ Expired: <b>{r['expired']}</b>\n"
+                f"🚫 Banned: <b>{r['banned']}</b>")
+        await query.edit_message_text(text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="dash:home")]]))
+        return
+    if data == "dash:expiring":
+        with db() as conn:
+            rows = conn.execute("""SELECT license_key, expires_at FROM licenses
+                WHERE banned=FALSE AND expires_at > NOW() AND expires_at <= NOW()+INTERVAL '7 days'
+                ORDER BY expires_at ASC LIMIT 15""").fetchall()
+        text = "⏳ <b>Expiring within 7 days</b>\n\n"
+        text += "\n".join(f"• <code>{r['license_key']}</code> — {r['expires_at'].strftime('%m-%d %H:%M UTC')}" for r in rows) if rows else "No keys expiring soon."
+        await query.edit_message_text(text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="dash:home")]]))
+        return
+    if data == "dash:logs":
+        with db() as conn:
+            rows = conn.execute("SELECT admin_id, action, target, created_at FROM admin_audit_logs ORDER BY id DESC LIMIT 10").fetchall()
+        text = "🧾 <b>Recent admin activity</b>\n\n"
+        text += "\n".join(f"• {r['action']} — <code>{r['target'] or '-'}</code>\n  {r['created_at'].strftime('%m-%d %H:%M UTC')} · UID {r['admin_id']}" for r in rows) if rows else "No activity recorded yet."
+        await query.edit_message_text(text[:4000], parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="dash:home")]]))
+        return
+    if data.startswith("keys:"):
+        try:
+            page = max(0, min(int(data.split(":", 1)[1]), 100000))
+        except ValueError:
+            page = 0
+        per_page = 8
+        offset = page * per_page
+        with db() as conn:
+            total = conn.execute("SELECT COUNT(*) AS n FROM licenses").fetchone()["n"]
+            rows = conn.execute(
+                """SELECT l.id, l.license_key, l.expires_at, l.banned, l.device_limit,
+                          COUNT(d.id) AS device_count
+                   FROM licenses l LEFT JOIN license_devices d ON d.license_id=l.id
+                   GROUP BY l.id ORDER BY l.id DESC LIMIT %s OFFSET %s""",
+                (per_page, offset),
+            ).fetchall()
+        if not rows and page > 0:
+            page -= 1
+            offset = page * per_page
+            with db() as conn:
+                rows = conn.execute(
+                    """SELECT l.id, l.license_key, l.expires_at, l.banned, l.device_limit,
+                              COUNT(d.id) AS device_count
+                       FROM licenses l LEFT JOIN license_devices d ON d.license_id=l.id
+                       GROUP BY l.id ORDER BY l.id DESC LIMIT %s OFFSET %s""",
+                    (per_page, offset),
+                ).fetchall()
+        keyboard = []
+        for r in rows:
+            limit = "∞" if r["device_limit"] is None else str(r["device_limit"] or 1)
+            status = "🚫" if r["banned"] else ("❌" if r["expires_at"] <= utcnow() else "✅")
+            short_key = r["license_key"] if len(r["license_key"]) <= 25 else r["license_key"][:22] + "…"
+            keyboard.append([InlineKeyboardButton(
+                f"{status} {short_key} · {r['device_count']}/{limit}",
+                callback_data=f"keyview:{r['id']}"
+            )])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"keys:{page-1}"))
+        if offset + per_page < total:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"keys:{page+1}"))
+        if nav:
+            keyboard.append(nav)
+        keyboard.append([InlineKeyboardButton("🏠 Dashboard", callback_data="dash:home")])
+        text = (
+            "📋 <b>LICENSE MANAGER</b>\\n"
+            "━━━━━━━━━━━━━━━━━━\\n"
+            f"Page <b>{page + 1}</b> · <b>{total}</b> licenses\\n\\n"
+            "Select a license to view its details."
+            if rows else "📋 <b>LICENSE MANAGER</b>\\n\\nNo licenses found."
+        )
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("keyview:"):
+        try:
+            license_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await query.answer("Invalid license.", show_alert=True)
+            return
+        with db() as conn:
+            found = conn.execute("SELECT license_key FROM licenses WHERE id=%s", (license_id,)).fetchone()
+        if not found:
+            await query.answer("License no longer exists.", show_alert=True)
+            return
+        row = license_display_data(found["license_key"])
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Back to keys", callback_data="keys:0")],
+            [InlineKeyboardButton("🏠 Dashboard", callback_data="dash:home")]
+        ])
+        await query.edit_message_text(format_key_card(row), parse_mode="HTML", reply_markup=keyboard)
+        return
+
 
 
 async def cmd_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -279,6 +532,10 @@ async def cmd_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "\n\n━━━━━━━━━━━━━━━━\n\n".join(cards),
         parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Dashboard", callback_data="dash:home"),
+            InlineKeyboardButton("📋 All keys", callback_data="keys:0"),
+        ]]),
     )
 
 
@@ -298,8 +555,8 @@ async def cmd_customkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     except ValueError:
         await update.effective_message.reply_text(
-            "Usage: /Customkey <suffix> <days> <device_no|Unlimited>\\n"
-            "Example: /Customkey ABCD1234 30 3\\n"
+            "Usage: /Customkey <suffix> <days> <device_no|Unlimited>\n"
+            "Example: /Customkey ABCD1234 30 3\n"
             "Example: /Customkey ABCD1234 30 Unlimited"
         )
         return
@@ -310,8 +567,13 @@ async def cmd_customkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
     full_row = license_display_data(row["license_key"])
+    audit_log(update.effective_user.id, "CUSTOM_KEY", row["license_key"], f"{days} day(s), device_limit={limit if limit is not None else 'Unlimited'}")
     await update.effective_message.reply_text(
-        format_key_card(full_row, generated=True), parse_mode="HTML"
+        format_key_card(full_row, generated=True), parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Dashboard", callback_data="dash:home"),
+            InlineKeyboardButton("📋 All keys", callback_data="keys:0"),
+        ]])
     )
 
 
@@ -338,6 +600,8 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
+    if cur.rowcount:
+        audit_log(update.effective_user.id, "RESET_DEVICES", key)
     await update.message.reply_text(
         "✅ Device binding reset." if cur.rowcount else "❌ Key not found."
     )
@@ -360,6 +624,8 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
+    if cur.rowcount:
+        audit_log(update.effective_user.id, "BAN", key, reason)
     await update.message.reply_text(
         "🚫 Key banned." if cur.rowcount else "❌ Key not found."
     )
@@ -380,6 +646,8 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
+    if cur.rowcount:
+        audit_log(update.effective_user.id, "UNBAN", key)
     await update.message.reply_text(
         "✅ Key unbanned." if cur.rowcount else "❌ Key not found."
     )
@@ -413,6 +681,8 @@ async def cmd_extend(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
+    if cur.rowcount:
+        audit_log(update.effective_user.id, "EXTEND", key, f"{days} day(s)")
     await update.message.reply_text(
         "✅ Expiry extended." if cur.rowcount else "❌ Key not found."
     )
@@ -433,6 +703,8 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
+    if cur.rowcount:
+        audit_log(update.effective_user.id, "DELETE", key)
     await update.message.reply_text(
         "🗑 Key deleted." if cur.rowcount else "❌ Key not found."
     )
@@ -452,7 +724,11 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     full_row = license_display_data(row["license_key"])
     await update.message.reply_text(
-        format_key_card(full_row), parse_mode="HTML"
+        format_key_card(full_row), parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Dashboard", callback_data="dash:home"),
+            InlineKeyboardButton("📋 All keys", callback_data="keys:0"),
+        ]])
     )
 
 
@@ -636,6 +912,9 @@ async def startup():
     telegram_app.add_handler(CommandHandler("info", cmd_info))
     telegram_app.add_handler(CommandHandler("list", cmd_list))
     telegram_app.add_handler(CommandHandler("stats", cmd_stats))
+    telegram_app.add_handler(CommandHandler("search", cmd_search))
+    telegram_app.add_handler(CommandHandler("expiring", cmd_expiring))
+    telegram_app.add_handler(CallbackQueryHandler(dashboard_callback, pattern=r"^(dash:|keys:|keyview:)"))
 
     await telegram_app.initialize()
     await telegram_app.start()
